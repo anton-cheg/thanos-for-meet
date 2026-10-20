@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="../icons/icon48.png" alt="" width="28" height="28">
+    <div class="title">
+      <h1>Thanos for Meet</h1>
+      <span id="pill" class="pill">…</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Пустая комната</h2>
+    </div>
+    <div class="room">
+      <div id="preview" class="preview"><span>нет снимка</span></div>
+      <p id="roomText">Выйди из кадра и сними пустую комнату — она заменит тебя в камере.</p>
+    </div>
+    <div class="buttons">
+      <button id="capture" class="secondary">Снять комнату</button>
+      <button id="toggle" class="primary">Исчезнуть</button>
+    </div>
+  </section>
+
+  <section class="card row">
+    <div>
+      <h2>Режим Таноса</h2>
+      <p>Рассыпаться в пыль и собраться обратно</p>
+    </div>
+    <label class="switch">
+      <input id="thanos" type="checkbox" checked>
+      <span></span>
+    </label>
+  </section>
+
+  <footer>
+    <span>Всё обрабатывается локально</span>
+    <span><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd></span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
