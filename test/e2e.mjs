@@ -95,7 +95,6 @@ const context = await chromium.launchPersistentContext(userDataDir, {
     '--use-fake-ui-for-media-stream',
     '--use-fake-device-for-media-stream',
     `--use-file-for-fake-video-capture=${y4m}`,
-    '--autoplay-policy=no-user-gesture-required',
   ],
 });
 
@@ -141,6 +140,19 @@ try {
   await step('mascot is on by default and the face tracker loads in its iframe', async () => {
     assert.equal((await status()).mascot, true);
     await waitFor('detector ready', async () => (await status()).detector === 'ready', 60000);
+  });
+
+  await step('microphone is tapped and heard', async () => {
+    // A page that captures the mic may play audio, so the AudioContext runs right away.
+    assert.equal((await status()).audio, 'running');
+    // Chrome's fake microphone beeps periodically.
+    let hi = 0;
+    for (let i = 0; i < 30 && hi < 0.3; i++) {
+      const st = await status();
+      hi = Math.max(hi, st.voice);
+      await sleep(100);
+    }
+    assert.ok(hi >= 0.3, `voice level should react to the mic, max=${hi.toFixed(2)}`);
   });
 
   if (FACE_VIDEO) {

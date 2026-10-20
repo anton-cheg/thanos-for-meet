@@ -77,7 +77,7 @@
 
   // ---------- microphone level, so the mouth moves when you talk ----------
 
-  const voice = { analyser: null, buf: null, level: 0 };
+  const voice = { ctx: null, analyser: null, buf: null, level: 0, floor: -60, lastResume: 0 };
 
   const tapAudio = (track) => {
     try {
@@ -87,23 +87,35 @@
       ctx.createMediaStreamSource(new MediaStream([track])).connect(analyser);
       voice.analyser = analyser;
       voice.buf = new Float32Array(analyser.fftSize);
-      if (ctx.state === 'suspended') {
-        const resume = () => ctx.resume();
-        window.addEventListener('pointerdown', resume, { once: true, capture: true });
-        window.addEventListener('keydown', resume, { once: true, capture: true });
-      }
     } catch (e) {
       console.warn('[clawd] cannot tap microphone', e);
     }
   };
 
+  // Loudness relative to the background noise, in [0, 1]. Working in dB with
+  // an adaptive floor makes quiet speech register regardless of mic gain.
   const voiceLevel = () => {
-    if (!voice.analyser) return 0;
-    voice.analyser.getFloatTimeDomainData(voice.buf);
+    const { ctx, analyser } = voice;
+    if (!analyser) return 0;
+    // An AudioContext created before any click starts suspended; once the page
+    // has had a user gesture (joining the call), resume() is allowed.
+    if (ctx.state === 'suspended') {
+      const now = performance.now();
+      if (now - voice.lastResume > 1000) {
+        voice.lastResume = now;
+        ctx.resume().catch(() => {});
+      }
+      return 0;
+    }
+    analyser.getFloatTimeDomainData(voice.buf);
     let sum = 0;
     for (const v of voice.buf) sum += v * v;
-    const rms = Math.sqrt(sum / voice.buf.length);
-    return Math.min(1, Math.max(0, (rms - 0.012) * 12));
+    const db = 10 * Math.log10(sum / voice.buf.length + 1e-10);
+    // The floor drops to silence quickly and creeps up slowly during speech.
+    voice.floor += (db - voice.floor) * (db < voice.floor ? 0.2 : 0.003);
+    voice.floor = Math.max(-90, voice.floor);
+    voice.level = Math.min(1, Math.max(0, (db - voice.floor - 6) / 22));
+    return voice.level;
   };
 
   // ---------- Clawd ----------
@@ -224,6 +236,7 @@
       // With a snapshot of the empty room the real body disappears completely.
       ctx.drawImage(state.room ?? frame, 0, 0, w, h);
 
+      const level = voiceLevel();
       const t = tracker.target;
       if (t) {
         const faceW = (t.x1 - t.x0) * w;
@@ -235,7 +248,7 @@
         c.roll += (target.roll - c.roll) * FOLLOW;
 
         // Fast attack, slower release, so speech reads as chatter, not flicker.
-        const want = Math.min(1, Math.max(t.jaw * 1.8, voiceLevel()));
+        const want = Math.min(1, Math.max(t.jaw * 1.8, level));
         this.mouth += (want - this.mouth) * (want > this.mouth ? 0.6 : 0.25);
 
         const cell = (c.size * SHOULDERS_PER_FACE) / BODY_CELLS;
@@ -305,6 +318,8 @@
       detector: !tracker.port ? 'off' : tracker.ready ? 'ready' : 'loading',
       face: !!tracker.target,
       mouth: livePipe()?.mouth ?? 0,
+      audio: voice.ctx?.state ?? 'none',
+      voice: voice.level,
     });
   }
 
