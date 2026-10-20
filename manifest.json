@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Thanos for Meet",
   "version": "1.0.0",
-  "description": "Исчезни из кадра в Google Meet: камера показывает пустую комнату. С режимом Таноса — рассыпаешься в пыль.",
+  "description": "Исчезни из кадра в Google Meet и Discord: камера показывает пустую комнату. С режимом Таноса — рассыпаешься в пыль.",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -16,19 +16,19 @@
     }
   },
   "permissions": ["storage"],
-  "host_permissions": ["https://meet.google.com/*"],
+  "host_permissions": ["https://meet.google.com/*", "https://discord.com/*"],
   "background": {
     "service_worker": "src/background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://meet.google.com/*"],
+      "matches": ["https://meet.google.com/*", "https://discord.com/*"],
       "js": ["src/inject.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://meet.google.com/*"],
+      "matches": ["https://meet.google.com/*", "https://discord.com/*"],
       "js": ["src/bridge.js"],
       "run_at": "document_start"
     }

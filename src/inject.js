@@ -1,5 +1,6 @@
 // Runs in the page's MAIN world at document_start. Wraps getUserMedia so every
-// camera track goes through our frame pipeline before Meet sees it.
+// camera track goes through our frame pipeline before the call sees it, and
+// mic tracks can be listened to for finger snaps.
 (() => {
   if (window.__thanosMeet) return;
   window.__thanosMeet = true;
@@ -23,15 +24,28 @@
   const SPREAD = 0.62;
   const LIFE = 0.38;
 
+  // Finger snap detector, all on ~5 ms blocks of the mic signal high-passed at 2 kHz.
+  const SNAP_BLOCK_MS = 5;
+  const SNAP_HP_HZ = 2000;
+  const SNAP_HP_SHARE = 0.3; // share of the block's energy above SNAP_HP_HZ: speech is far lower
+  const SNAP_MAX_MS = 100; // a snap must die out within this, hiss and speech don't
+  const SNAP_DECAY = 0.06; // ...down to this share of its peak energy
+  const SNAP_COOLDOWN_MS = 1000;
+  const SNAP_WARMUP_MS = 500; // let the noise floor settle first
+
   const state = {
     room: null, // ImageBitmap of the empty room
     roomSmall: new Map(), // "w x h" -> ImageData of the room at analysis size
     thanos: true,
     gone: false,
+    snap: false,
+    snapSens: 3, // 1..5
   };
   let anim = null; // { id, kind: 'vanish' | 'appear', thanos, start, dur }
   let animSeq = 0;
   const pipes = new Set();
+  const mics = new Set(); // the page's mic tracks
+  const taps = new Map(); // mic track -> SnapTap, only while snap is on
 
   const post = (msg) => window.postMessage({ ns: NS, dir: 'out', ...msg }, '*');
 
@@ -42,6 +56,8 @@
     gone: state.gone,
     animating: !!anim,
     thanos: state.thanos,
+    mic: [...mics].some((t) => t.readyState === 'live'),
+    snap: state.snap,
   });
   const sendStatus = () => post(status());
 
@@ -406,11 +422,171 @@
     }
   }
 
+  // ---------- finger snap ----------
+
+  // Sensitivity 1..5 -> how far above the noise floor (power ratio) and how loud
+  // (high-passed peak) a click has to be.
+  const snapLevels = () => ({
+    ratio: 10 ** ((28 - 3 * state.snapSens) / 10),
+    peak: 0.3 * 0.6 ** (state.snapSens - 1),
+  });
+
+  // Listens to a clone of a page mic track, so muting in the call (which
+  // disables the page's track) doesn't stop the snaps from being heard.
+  class SnapTap {
+    constructor(src) {
+      this.track = src.clone();
+      this.track.enabled = true;
+      this.reader = new MediaStreamTrackProcessor({ track: this.track }).readable.getReader();
+      this.rate = 0;
+      this.buf = new Float32Array(0);
+      this.lastSnap = -Infinity;
+      this.loop();
+    }
+
+    stop() {
+      this.track.stop();
+      this.reader.cancel().catch(() => {});
+    }
+
+    async loop() {
+      try {
+        for (;;) {
+          const { value: data, done } = await this.reader.read();
+          if (done) break;
+          try {
+            this.feed(data);
+          } finally {
+            data.close();
+          }
+        }
+      } catch (e) {
+        if (this.track.readyState === 'live') console.error('[thanos] mic tap stopped', e);
+      }
+    }
+
+    reset(rate) {
+      this.rate = rate;
+      this.block = Math.round((rate * SNAP_BLOCK_MS) / 1000);
+      const rc = 1 / (2 * Math.PI * SNAP_HP_HZ);
+      this.a = rc / (rc + 1 / rate);
+      this.x = 0;
+      this.y = 0;
+      this.k = 0;
+      this.eHp = 0;
+      this.eAll = 0;
+      this.peak = 0;
+      this.blocks = 0;
+      this.floor = 0;
+      this.prevE = 0;
+      this.cand = null; // { maxHp, maxAll, blocks } while a click is ringing out
+    }
+
+    feed(data) {
+      if (data.sampleRate !== this.rate) this.reset(data.sampleRate);
+      const n = data.numberOfFrames;
+      if (this.buf.length < n) this.buf = new Float32Array(n);
+      const buf = this.buf;
+      data.copyTo(buf, { planeIndex: 0, format: 'f32-planar' });
+      for (let i = 0; i < n; i++) {
+        const x = buf[i];
+        const y = this.a * (this.y + x - this.x);
+        this.x = x;
+        this.y = y;
+        this.eHp += y * y;
+        this.eAll += x * x;
+        const ay = Math.abs(y);
+        if (ay > this.peak) this.peak = ay;
+        if (++this.k === this.block) {
+          this.onBlock(this.eHp / this.block, this.eAll / this.block, this.peak);
+          this.k = 0;
+          this.eHp = 0;
+          this.eAll = 0;
+          this.peak = 0;
+        }
+      }
+    }
+
+    onBlock(e, eAll, peak) {
+      const blockMs = (this.block / this.rate) * 1000;
+      if (++this.blocks * blockMs < SNAP_WARMUP_MS) {
+        this.floor = this.floor ? Math.min(this.floor, e) : e;
+        this.prevE = e;
+        return;
+      }
+      const { ratio, peak: minPeak } = snapLevels();
+      const loud = this.floor * ratio;
+      const c = this.cand;
+      if (c) {
+        // Fire once the click has died out in the whole band: a "t" or "k"
+        // in speech is followed by a loud vowel, a hiss just keeps going.
+        if (e < c.maxHp * SNAP_DECAY && eAll < c.maxAll * SNAP_DECAY * 2) {
+          this.cand = null;
+          const now = performance.now();
+          if (now - this.lastSnap > SNAP_COOLDOWN_MS) {
+            this.lastSnap = now;
+            onSnap();
+          }
+        } else if (++c.blocks * blockMs > SNAP_MAX_MS) {
+          this.cand = null;
+        } else {
+          c.maxHp = Math.max(c.maxHp, e);
+          c.maxAll = Math.max(c.maxAll, eAll);
+        }
+      } else if (e > loud && this.prevE < loud && peak > minPeak && e > eAll * SNAP_HP_SHARE) {
+        this.cand = { maxHp: e, maxAll: eAll, blocks: 0 };
+      }
+      // Noise floor: falls fast, rises slowly (~3 s), frozen while a click rings out.
+      if (!this.cand) this.floor = Math.max(1e-10, this.floor + (e - this.floor) * (e < this.floor ? 0.05 : 0.002));
+      this.prevE = e;
+    }
+  }
+
+  const syncTaps = () => {
+    for (const t of mics) if (t.readyState !== 'live') mics.delete(t);
+    for (const [t, tap] of taps) {
+      if (state.snap && mics.has(t)) continue;
+      tap.stop();
+      taps.delete(t);
+    }
+    if (state.snap) {
+      for (const t of mics) {
+        if (taps.has(t)) continue;
+        try {
+          taps.set(t, new SnapTap(t));
+        } catch (e) {
+          console.error('[thanos] cannot listen to the mic', e);
+        }
+      }
+    }
+    sendStatus();
+  };
+
+  const addMic = (track) => {
+    mics.add(track);
+    // Our clone must not keep the mic open after the page is done with it.
+    const stop = track.stop.bind(track);
+    track.stop = () => {
+      stop();
+      syncTaps();
+    };
+    track.addEventListener('ended', syncTaps);
+  };
+
+  const onSnap = () => {
+    if (anim || !livePipe()) return;
+    toggle();
+  };
+
   // ---------- getUserMedia hook ----------
 
   const realGetUserMedia = md.getUserMedia.bind(md);
   md.getUserMedia = async function getUserMedia(constraints) {
     const stream = await realGetUserMedia(constraints);
+    if (stream.getAudioTracks().length) {
+      stream.getAudioTracks().forEach(addMic);
+      syncTaps();
+    }
     if (!constraints || !constraints.video) return stream;
     const tracks = stream.getTracks().map((track) => {
       if (track.kind !== 'video') return track;
@@ -468,6 +644,8 @@
     sendStatus();
   };
 
+  const toggle = () => go((anim ? anim.kind === 'vanish' : state.gone) ? 'appear' : 'vanish');
+
   window.addEventListener('message', (e) => {
     if (e.source !== window) return;
     const m = e.data;
@@ -493,7 +671,12 @@
         go(m.type);
         break;
       case 'toggle':
-        go((anim ? anim.kind === 'vanish' : state.gone) ? 'appear' : 'vanish');
+        toggle();
+        break;
+      case 'setSnap':
+        state.snap = !!m.enabled;
+        state.snapSens = Math.min(5, Math.max(1, Number(m.sens) || 3));
+        syncTaps();
         break;
       case 'status':
         sendStatus();

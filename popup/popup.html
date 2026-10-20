@@ -38,6 +38,23 @@
     </label>
   </section>
 
+  <section class="card">
+    <div class="row">
+      <div>
+        <h2>По щелчку пальцами</h2>
+        <p id="snapText">Щёлкни — исчезнешь, щёлкни ещё раз — вернёшься</p>
+      </div>
+      <label class="switch">
+        <input id="snap" type="checkbox">
+        <span></span>
+      </label>
+    </div>
+    <label id="sensRow" class="sens" hidden>
+      <span>Чувствительность</span>
+      <input id="snapSens" type="range" min="1" max="5" step="1" value="3">
+    </label>
+  </section>
+
   <footer>
     <span>Всё обрабатывается локально</span>
     <span><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd></span>

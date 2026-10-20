@@ -4,19 +4,26 @@
   const NS = 'thanos-meet';
   const CAPTURE_DELAY = 3;
 
-  let status = { type: 'status', camera: false, hasRoom: false, gone: false, animating: false, thanos: true };
+  let status = { type: 'status', camera: false, hasRoom: false, gone: false, animating: false, thanos: true, mic: false, snap: false };
   let countingDown = false;
 
   const toPage = (msg) => window.postMessage({ ns: NS, dir: 'in', ...msg }, '*');
+
+  const sendSnap = () =>
+    chrome.storage.local.get({ snap: false, snapSens: 3 }, ({ snap, snapSens }) =>
+      toPage({ type: 'setSnap', enabled: snap, sens: snapSens })
+    );
 
   chrome.storage.local.get({ room: null, thanos: true }, ({ room, thanos }) => {
     toPage({ type: 'setThanos', value: thanos });
     if (room) toPage({ type: 'setRoom', dataUrl: room });
   });
+  sendSnap();
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     if (changes.thanos) toPage({ type: 'setThanos', value: changes.thanos.newValue });
+    if (changes.snap || changes.snapSens) sendSnap();
     // Rooms captured in this tab are already loaded; only sync removals.
     if (changes.room && !changes.room.newValue) toPage({ type: 'setRoom', dataUrl: null });
   });

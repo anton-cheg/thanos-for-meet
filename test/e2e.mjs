@@ -16,6 +16,8 @@ const out = join(root, 'test', 'out');
 mkdirSync(out, { recursive: true });
 const y4m = join(out, 'fake-camera.y4m');
 if (!existsSync(y4m)) execFileSync('python3', [join(root, 'test', 'make_fake_camera.py'), y4m], { stdio: 'inherit' });
+const wav = join(out, 'fake-mic.wav');
+if (!existsSync(wav)) execFileSync('python3', [join(root, 'test', 'make_fake_mic.py'), wav], { stdio: 'inherit' });
 const DEMO = !!process.env.DEMO;
 
 const PAGE = `<!doctype html><html><body style="margin:0;background:#000">
@@ -81,13 +83,14 @@ const context = await chromium.launchPersistentContext(userDataDir, {
     '--use-fake-ui-for-media-stream',
     '--use-fake-device-for-media-stream',
     `--use-file-for-fake-video-capture=${y4m}`,
+    `--use-file-for-fake-audio-capture=${wav}`,
   ],
 });
 
 try {
-  await context.route('https://meet.google.com/**', (route) =>
-    route.fulfill({ status: 200, contentType: 'text/html', body: PAGE })
-  );
+  for (const site of ['https://meet.google.com/**', 'https://discord.com/**']) {
+    await context.route(site, (route) => route.fulfill({ status: 200, contentType: 'text/html', body: PAGE }));
+  }
   const sw = context.serviceWorkers()[0] ?? (await context.waitForEvent('serviceworker'));
   const extId = sw.url().split('/')[2];
 
@@ -96,11 +99,11 @@ try {
   page.on('pageerror', (e) => console.log('    [pageerror]', e.message));
   await page.goto('https://meet.google.com/abc-defg-hij');
 
-  const toTab = (msg) =>
-    sw.evaluate(async (m) => {
-      const [t] = await chrome.tabs.query({ url: 'https://meet.google.com/*' });
+  const toTab = (msg, url = 'https://meet.google.com/*') =>
+    sw.evaluate(async ([m, u]) => {
+      const [t] = await chrome.tabs.query({ url: u });
       return chrome.tabs.sendMessage(t.id, m);
-    }, msg);
+    }, [msg, url]);
   const storage = (set) =>
     sw.evaluate((s) => (s ? chrome.storage.local.set(s) : chrome.storage.local.get(null)), set ?? null);
   const sample = (pt) => page.evaluate(([x, y]) => window.sample(x, y), pt);
@@ -233,9 +236,50 @@ try {
     await popup.close();
   }
 
+  await step('finger snap: vanish and back, speech and hiss are ignored', async () => {
+    // The mic file loops every 8 s with one snap at 4 s, speech and a hiss around it.
+    await storage({ thanos: false, snap: true });
+    const t0 = await page.evaluate(async () => {
+      window.mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      window.mic.getAudioTracks()[0].enabled = false; // muted in the call
+      return Date.now();
+    });
+    await waitFor('mic in status', async () => (await toTab({ cmd: 'getStatus' })).mic, 5000);
+    await waitFor('snap → vanish', async () => (await toTab({ cmd: 'getStatus' })).gone, 10000);
+    const at = Date.now() - t0;
+    assert.ok(at > 3800, `vanished at ${at} ms, before the snap at 4000 ms`);
+    // Through the speech after the snap and the next loop's speech and hiss.
+    await sleep(7000);
+    assert.equal((await toTab({ cmd: 'getStatus' })).gone, true, 'speech or hiss toggled it back');
+    await waitFor('second snap → back', async () => !(await toTab({ cmd: 'getStatus' })).gone, 6000);
+    assert.ok(await isPerson());
+
+    await page.evaluate(() => window.mic.getTracks().forEach((t) => t.stop()));
+    await waitFor('mic released', async () => !(await toTab({ cmd: 'getStatus' })).mic, 3000);
+    await storage({ snap: false });
+  });
+
   await step('stopping the wrapped track stops the camera', async () => {
     await page.evaluate(() => window.stream.getVideoTracks()[0].stop());
     await waitFor('camera off', async () => !(await toTab({ cmd: 'getStatus' })).camera, 5000);
+  });
+
+  await step('Discord: camera is wrapped and the popup sees the tab', async () => {
+    const discord = await context.newPage();
+    await discord.goto('https://discord.com/channels/@me');
+    const label = await discord.evaluate(() => window.start());
+    assert.ok(label.length > 0);
+    await waitFor('discord status.camera', async () => (await toTab({ cmd: 'getStatus' }, 'https://discord.com/*')).camera);
+
+    const popup = await context.newPage();
+    await popup.addInitScript(() => {
+      const q = chrome.tabs.query.bind(chrome.tabs);
+      chrome.tabs.query = () => q({ url: 'https://discord.com/*' });
+    });
+    await popup.goto(`chrome-extension://${extId}/popup/popup.html`);
+    await popup.waitForFunction(() => document.getElementById('pill').textContent === 'камера активна', null, { timeout: 5000 });
+    await popup.close();
+    await discord.close();
   });
 
   console.log(`\n${passed} passed`);
