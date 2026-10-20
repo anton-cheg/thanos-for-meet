@@ -1,4 +1,4 @@
-const COMMANDS = { 'toggle-vanish': 'toggle', 'capture-room': 'capture' };
+const COMMANDS = { 'toggle-mascot': 'toggle', 'capture-room': 'capture' };
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
   const cmd = COMMANDS[command];

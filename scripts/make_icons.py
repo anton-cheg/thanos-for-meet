@@ -1,37 +1,28 @@
-"""Draws the extension icon: a half-dissolved figure on a purple gauntlet-gold disc."""
-import random
+"""Draws the extension icon: pixel-art Clawd on a dark rounded tile."""
 from PIL import Image, ImageDraw
 
 S = 512
+CELL = 12
+CLAWD = (215, 119, 87, 255)
+INK = (27, 19, 16, 255)
+
+# Same grid as src/inject.js: (row, x0, x1)
+rows = [(y, 6, 30) for y in range(4)] + [(y, 2, 34) for y in (4, 5)] + [(y, 6, 30) for y in range(6, 14)]
+legs = [(x, 14, 2) for x in (8, 12, 22, 26)]
+eyes = [10, 24]
+
 img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
 d = ImageDraw.Draw(img)
-for r in range(S // 2, 0, -1):
-    k = r / (S / 2)
-    d.ellipse((S / 2 - r, S / 2 - r, S / 2 + r, S / 2 + r),
-              fill=(int(70 + 60 * (1 - k)), int(40 + 20 * (1 - k)), int(140 + 60 * (1 - k)), 255))
-
-fig = Image.new("L", (S, S), 0)
-f = ImageDraw.Draw(fig)
-f.ellipse((186, 96, 306, 216), fill=255)            # head
-f.rounded_rectangle((126, 236, 366, 470), 90, fill=255)  # shoulders
-circle = Image.new("L", (S, S), 0)
-ImageDraw.Draw(circle).ellipse((0, 0, S, S), fill=255)
-
-random.seed(7)
-gold = (246, 196, 83, 255)
-px = fig.load()
-for y in range(S):
-    for x in range(S):
-        if px[x, y] and x > 250 + 60 * random.random() - 30 + (y - 280) * 0.15:
-            px[x, y] = 0
-solid = Image.new("RGBA", (S, S), gold)
-img.paste(solid, (0, 0), Image.composite(fig, Image.new("L", (S, S), 0), circle))
-for _ in range(260):
-    x = random.uniform(250, 470)
-    y = random.uniform(90, 470)
-    s = random.uniform(6, 18) * (1 - (x - 250) / 300)
-    if (x - S / 2) ** 2 + (y - S / 2) ** 2 < (S / 2 - 20) ** 2:
-        d.rectangle((x, y, x + s, y + s), fill=gold)
+d.rounded_rectangle((0, 0, S - 1, S - 1), 110, fill=(28, 24, 22, 255))
+ox = (S - 36 * CELL) // 2
+oy = (S - 16 * CELL) // 2
+cell = lambda x, y: (ox + x * CELL, oy + y * CELL)
+for y, x0, x1 in rows:
+    d.rectangle((*cell(x0, y), cell(x1, y + 1)[0] - 1, cell(x1, y + 1)[1] - 1), fill=CLAWD)
+for x, y, h in legs:
+    d.rectangle((*cell(x, y), cell(x + 2, y + h)[0] - 1, cell(x + 2, y + h)[1] - 1), fill=CLAWD)
+for x in eyes:
+    d.rectangle((*cell(x, 1), cell(x + 2, 4)[0] - 1, cell(x + 2, 4)[1] - 1), fill=INK)
 
 for size in (16, 48, 128):
     img.resize((size, size), Image.LANCZOS).save(f"icons/icon{size}.png")

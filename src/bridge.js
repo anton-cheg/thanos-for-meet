@@ -1,22 +1,53 @@
 // Isolated-world content script: relays between the extension (popup,
-// background, storage) and inject.js living in the page's MAIN world.
+// background, storage) and inject.js living in the page's MAIN world, and
+// embeds the face-tracking iframe when the mascot is on.
 (() => {
-  const NS = 'thanos-meet';
+  const NS = 'clawd-meet';
   const CAPTURE_DELAY = 3;
 
-  let status = { type: 'status', camera: false, hasRoom: false, gone: false, animating: false, thanos: true };
+  let status = { type: 'status', camera: false, hasRoom: false, mascot: false, detector: 'off', face: false };
   let countingDown = false;
+  let mascot = false;
 
-  const toPage = (msg) => window.postMessage({ ns: NS, dir: 'in', ...msg }, '*');
+  const toPage = (msg, transfer) => window.postMessage({ ns: NS, dir: 'in', ...msg }, '*', transfer);
+  const publicStatus = () => ({ ...status, countingDown });
+  const pushStatus = () => chrome.runtime.sendMessage({ event: 'status', status: publicStatus() }).catch(() => {});
 
-  chrome.storage.local.get({ room: null, thanos: true }, ({ room, thanos }) => {
-    toPage({ type: 'setThanos', value: thanos });
+  // ---------- face detector iframe ----------
+
+  let detector = null;
+  function ensureDetector() {
+    if (detector) return;
+    detector = document.createElement('iframe');
+    detector.src = chrome.runtime.getURL('detector/detector.html');
+    detector.allow = '';
+    detector.setAttribute('aria-hidden', 'true');
+    detector.style.cssText =
+      'position:fixed;left:-20px;top:-20px;width:2px;height:2px;border:0;opacity:0;pointer-events:none;';
+    detector.addEventListener('load', () => {
+      const { port1, port2 } = new MessageChannel();
+      detector.contentWindow.postMessage({ type: 'clawd-port' }, new URL(detector.src).origin, [port1]);
+      toPage({ type: 'detectorPort' }, [port2]);
+    });
+    (document.body || document.documentElement).appendChild(detector);
+  }
+
+  const setMascot = (value) => {
+    mascot = !!value;
+    if (mascot) ensureDetector();
+    toPage({ type: 'setMascot', value: mascot });
+  };
+
+  // ---------- storage sync ----------
+
+  chrome.storage.local.get({ room: null, mascot: true }, ({ room, mascot: on }) => {
     if (room) toPage({ type: 'setRoom', dataUrl: room });
+    setMascot(on);
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
-    if (changes.thanos) toPage({ type: 'setThanos', value: changes.thanos.newValue });
+    if (changes.mascot) setMascot(changes.mascot.newValue);
     // Rooms captured in this tab are already loaded; only sync removals.
     if (changes.room && !changes.room.newValue) toPage({ type: 'setRoom', dataUrl: null });
   });
@@ -27,22 +58,14 @@
     if (!m || m.ns !== NS || m.dir !== 'out') return;
     if (m.type === 'status') {
       status = m;
-      chrome.runtime.sendMessage({ event: 'status', status: publicStatus() }).catch(() => {});
+      pushStatus();
     } else if (m.type === 'roomCaptured') {
       chrome.storage.local.set({ room: m.dataUrl });
-      toast('Комната сохранена. Можно исчезать');
+      toast('Комната сохранена — теперь Clawd заменяет тебя целиком');
     } else if (m.type === 'error') {
-      toast(
-        m.code === 'no-camera'
-          ? 'Камера не включена'
-          : m.code === 'no-room'
-            ? 'Сначала сними пустую комнату'
-            : 'Ошибка'
-      );
+      toast(m.code === 'no-camera' ? 'Камера не включена' : 'Ошибка');
     }
   });
-
-  const publicStatus = () => ({ ...status, countingDown });
 
   const capture = async (delay = CAPTURE_DELAY) => {
     if (countingDown) return;
@@ -51,7 +74,7 @@
       return;
     }
     countingDown = true;
-    chrome.runtime.sendMessage({ event: 'status', status: publicStatus() }).catch(() => {});
+    pushStatus();
     for (let i = delay; i > 0; i--) {
       toast(`Выйди из кадра… ${i}`, 1100);
       await new Promise((r) => setTimeout(r, 1000));
@@ -69,9 +92,8 @@
         capture(msg.delay);
         break;
       case 'toggle':
-      case 'vanish':
-      case 'appear':
-        toPage({ type: msg.cmd });
+        chrome.storage.local.set({ mascot: !mascot });
+        toast(mascot ? 'Clawd ушёл, ты снова в кадре' : 'Теперь вместо тебя Clawd');
         break;
       default:
         return;
@@ -86,7 +108,7 @@
   function toast(text, ms = 2200) {
     if (!toastHost) {
       toastHost = document.createElement('div');
-      toastHost.id = 'thanos-meet-toast';
+      toastHost.id = 'clawd-meet-toast';
       const root = toastHost.attachShadow({ mode: 'open' });
       root.innerHTML = `<style>
         div { position: fixed; top: 18px; left: 50%; transform: translate(-50%, -8px); z-index: 2147483647;

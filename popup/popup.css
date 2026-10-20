@@ -6,7 +6,7 @@
   --muted: #9aa0a6;
   --accent: #8ab4f8;
   --accent-ink: #0b1d3a;
-  --purple: #a77bf3;
+  --clawd: #d77757;
 }
 
 * { box-sizing: border-box; }
@@ -35,7 +35,7 @@ p { margin: 0; color: var(--muted); font-size: 12px; }
   color: var(--muted);
 }
 .pill.ok { background: rgba(129, 201, 149, .15); color: #81c995; }
-.pill.gone { background: rgba(167, 123, 243, .18); color: var(--purple); }
+.pill.clawd { background: rgba(215, 119, 87, .18); color: var(--clawd); }
 
 .card {
   background: var(--card);
@@ -60,7 +60,6 @@ p { margin: 0; color: var(--muted); font-size: 12px; }
 }
 .preview.has span { display: none; }
 
-.buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 button {
   border: 0;
   border-radius: 10px;
@@ -72,8 +71,7 @@ button {
 button:hover:not(:disabled) { filter: brightness(1.1); }
 button:disabled { opacity: .4; cursor: default; }
 .secondary { background: var(--line); color: var(--text); }
-.primary { background: var(--accent); color: var(--accent-ink); }
-.primary.back { background: var(--purple); color: #1d0f36; }
+.wide { width: 100%; }
 
 .switch { position: relative; width: 38px; height: 22px; flex: none; }
 .switch input { opacity: 0; width: 0; height: 0; }
@@ -84,7 +82,7 @@ button:disabled { opacity: .4; cursor: default; }
   content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
   background: var(--text); transition: transform .2s;
 }
-.switch input:checked + span { background: var(--purple); }
+.switch input:checked + span { background: var(--clawd); }
 .switch input:checked + span::after { transform: translateX(16px); }
 
 footer { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; padding: 2px 4px 0; }

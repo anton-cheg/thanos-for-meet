@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Thanos for Meet",
+  "name": "Clawd for Meet",
   "version": "1.0.0",
-  "description": "Исчезни из кадра в Google Meet: камера показывает пустую комнату. С режимом Таноса — рассыпаешься в пыль.",
+  "description": "Вместо тебя в Google Meet — Clawd, маскот Claude Code: следит за головой, моргает и шевелит ртом, когда ты говоришь.",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -15,32 +15,62 @@
       "48": "icons/icon48.png"
     }
   },
-  "permissions": ["storage"],
-  "host_permissions": ["https://meet.google.com/*"],
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://meet.google.com/*"
+  ],
   "background": {
     "service_worker": "src/background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://meet.google.com/*"],
-      "js": ["src/inject.js"],
+      "matches": [
+        "https://meet.google.com/*"
+      ],
+      "js": [
+        "src/inject.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://meet.google.com/*"],
-      "js": ["src/bridge.js"],
+      "matches": [
+        "https://meet.google.com/*"
+      ],
+      "js": [
+        "src/bridge.js"
+      ],
       "run_at": "document_start"
     }
   ],
   "commands": {
-    "toggle-vanish": {
-      "suggested_key": { "default": "Alt+Shift+X" },
-      "description": "Исчезнуть / вернуться"
+    "toggle-mascot": {
+      "suggested_key": {
+        "default": "Alt+Shift+X"
+      },
+      "description": "Включить / выключить маскота"
     },
     "capture-room": {
-      "suggested_key": { "default": "Alt+Shift+R" },
+      "suggested_key": {
+        "default": "Alt+Shift+R"
+      },
       "description": "Снять пустую комнату (через 3 секунды)"
     }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "detector/*",
+        "vendor/*"
+      ],
+      "matches": [
+        "https://meet.google.com/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   }
 }

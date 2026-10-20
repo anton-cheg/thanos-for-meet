@@ -1,12 +1,12 @@
 // End-to-end test: loads the unpacked extension into Chromium, feeds a fake
-// camera (empty room -> person), serves a stub page on meet.google.com so the
-// real content scripts run, and checks what the page receives from getUserMedia.
+// camera, serves a stub page on meet.google.com so the real content scripts
+// run, and checks what the page receives from getUserMedia.
 //
-//   npm test            # run checks
-//   DEMO=1 npm test     # also write test/out/demo.gif and popup.png
+//   FACE_VIDEO=clip.mp4 npm test   # a short clip of a talking face (needed for tracking checks)
+//   DEMO=1 ...                     # also write test/out/demo.gif and popup.png
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
@@ -14,53 +14,67 @@ import { chromium } from 'playwright';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const out = join(root, 'test', 'out');
 mkdirSync(out, { recursive: true });
-const y4m = join(out, 'fake-camera.y4m');
-if (!existsSync(y4m)) execFileSync('python3', [join(root, 'test', 'make_fake_camera.py'), y4m], { stdio: 'inherit' });
 const DEMO = !!process.env.DEMO;
+const FACE_VIDEO = process.env.FACE_VIDEO;
+
+let y4m;
+if (FACE_VIDEO) {
+  y4m = join(out, 'face-camera.y4m');
+  execFileSync(
+    join(root, 'test', 'make_face_camera.sh'),
+    [FACE_VIDEO, y4m, process.env.FACE_START ?? '0', process.env.FACE_DURATION ?? '0.75'],
+    { stdio: 'inherit' }
+  );
+} else {
+  y4m = join(out, 'fake-camera.y4m');
+  if (!existsSync(y4m)) execFileSync('python3', [join(root, 'test', 'make_fake_camera.py'), y4m], { stdio: 'inherit' });
+  console.log('FACE_VIDEO not set: face tracking checks are skipped');
+}
 
 const PAGE = `<!doctype html><html><body style="margin:0;background:#000">
-<video id="v" autoplay muted playsinline style="width:960px;height:540px;display:block"></video>
+<video id="v" autoplay muted playsinline style="width:640px;height:480px;display:block"></video>
 <script>
   const v = document.getElementById('v');
-  const c = new OffscreenCanvas(480, 270);
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  let room = null;
+  let c, ctx;
   window.start = async () => {
-    window.stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-    v.srcObject = stream;
+    window.stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    v.srcObject = new MediaStream(stream.getVideoTracks());
     await new Promise((r) => (v.onplaying = r));
-    return stream.getVideoTracks()[0].label;
+    c = new OffscreenCanvas(v.videoWidth, v.videoHeight);
+    ctx = c.getContext('2d', { willReadFrequently: true });
+    return { label: stream.getVideoTracks()[0].label, w: v.videoWidth, h: v.videoHeight };
   };
-  const grab = () => { ctx.drawImage(v, 0, 0, 480, 270); return ctx.getImageData(0, 0, 480, 270).data; };
-  window.sample = (x, y) => {
-    const d = grab(); const s = [0, 0, 0];
-    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
-      const p = ((y + dy) * 480 + x + dx) * 4; s[0] += d[p]; s[1] += d[p + 1]; s[2] += d[p + 2];
+  const grab = () => { ctx.drawImage(v, 0, 0); return ctx.getImageData(0, 0, c.width, c.height); };
+  // Share of Clawd-orange pixels and their bounding box.
+  window.clawd = () => {
+    const { data, width, height } = grab();
+    let n = 0, x0 = width, y0 = height, x1 = 0, y1 = 0;
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      const p = (y * width + x) * 4;
+      if (Math.abs(data[p] - 215) < 18 && Math.abs(data[p + 1] - 119) < 18 && Math.abs(data[p + 2] - 87) < 18) {
+        n++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
     }
-    return s.map((n) => Math.round(n / 25));
+    return { share: n / (width * height), box: [x0, y0, x1, y1] };
   };
-  window.setRoom = async (url) => {
-    const img = await createImageBitmap(await (await fetch(url)).blob());
-    const rc = new OffscreenCanvas(480, 270).getContext('2d');
-    rc.drawImage(img, 0, 0, 480, 270); room = rc.getImageData(0, 0, 480, 270).data;
-  };
-  // Share of pixels in a box that differ from the captured room.
-  window.diff = (x0, y0, x1, y1) => {
-    const d = grab(); let n = 0, all = 0;
-    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-      const p = (y * 480 + x) * 4; all++;
-      if (Math.abs(d[p] - room[p]) + Math.abs(d[p + 1] - room[p + 1]) + Math.abs(d[p + 2] - room[p + 2]) > 60) n++;
+  let prev = null;
+  // Mean per-pixel change inside a box since the previous call.
+  window.motion = (x0, y0, x1, y1) => {
+    const { data, width } = grab(); let sum = 0, n = 0;
+    if (prev) for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+      const p = (y * width + x) * 4; sum += Math.abs(data[p] - prev[p]) + Math.abs(data[p + 1] - prev[p + 1]); n++;
     }
-    return n / all;
+    prev = data;
+    return n ? sum / n : 0;
   };
+  window.clawdStatus = () => new Promise((res) => {
+    const h = (e) => { if (e.data?.ns === 'clawd-meet' && e.data.dir === 'out' && e.data.type === 'status') { removeEventListener('message', h); res(e.data); } };
+    addEventListener('message', h);
+    postMessage({ ns: 'clawd-meet', dir: 'in', type: 'status' }, '*');
+  });
 </script></body></html>`;
 
-const TORSO = [220, 235];
-const FACE = [220, 110];
-const TORSO_COLOR = [28, 30, 36];
-const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 let passed = 0;
 const step = async (name, fn) => {
   const t = Date.now();
@@ -74,13 +88,14 @@ rmSync(userDataDir, { recursive: true, force: true });
 const context = await chromium.launchPersistentContext(userDataDir, {
   channel: 'chromium',
   headless: !process.env.HEADED,
-  viewport: { width: 960, height: 540 },
+  viewport: { width: 640, height: 480 },
   args: [
     `--disable-extensions-except=${root}`,
     `--load-extension=${root}`,
     '--use-fake-ui-for-media-stream',
     '--use-fake-device-for-media-stream',
     `--use-file-for-fake-video-capture=${y4m}`,
+    '--autoplay-policy=no-user-gesture-required',
   ],
 });
 
@@ -92,7 +107,7 @@ try {
   const extId = sw.url().split('/')[2];
 
   const page = await context.newPage();
-  page.on('console', (m) => m.type() === 'error' && console.log('    [page]', m.text()));
+  page.on('console', (m) => ['error', 'warning'].includes(m.type()) && console.log(`    [page ${m.type()}]`, m.text()));
   page.on('pageerror', (e) => console.log('    [pageerror]', e.message));
   await page.goto('https://meet.google.com/abc-defg-hij');
 
@@ -103,139 +118,113 @@ try {
     }, msg);
   const storage = (set) =>
     sw.evaluate((s) => (s ? chrome.storage.local.set(s) : chrome.storage.local.get(null)), set ?? null);
-  const sample = (pt) => page.evaluate(([x, y]) => window.sample(x, y), pt);
-  const isPerson = async () => dist(await sample(TORSO), TORSO_COLOR) < 45;
-  const waitFor = async (what, fn, timeout = 25000) => {
+  const status = () => page.evaluate(() => window.clawdStatus());
+  const clawd = () => page.evaluate(() => window.clawd());
+  const waitFor = async (what, fn, timeout = 30000) => {
     const end = Date.now() + timeout;
     while (Date.now() < end) {
       if (await fn()) return;
-      await sleep(60);
+      await sleep(100);
     }
     throw new Error(`timeout waiting for ${what}`);
   };
 
-  console.log('Thanos for Meet e2e');
+  console.log('Clawd for Meet e2e');
+  let size;
 
   await step('getUserMedia is wrapped, camera label preserved', async () => {
-    const label = await page.evaluate(() => window.start());
-    assert.ok(label.length > 0, 'label should come from the real camera');
-    await waitFor('status.camera', async () => (await toTab({ cmd: 'getStatus' })).camera);
+    size = await page.evaluate(() => window.start());
+    assert.ok(size.label.length > 0, 'label should come from the real camera');
+    await waitFor('status.camera', async () => (await status()).camera);
   });
 
-  await step('passthrough before capture: page sees the real camera', async () => {
-    await waitFor('person in frame', isPerson);
-    const st = await toTab({ cmd: 'getStatus' });
-    assert.equal(st.hasRoom, false);
-    assert.equal(st.gone, false);
+  await step('mascot is on by default and the face tracker loads in its iframe', async () => {
+    assert.equal((await status()).mascot, true);
+    await waitFor('detector ready', async () => (await status()).detector === 'ready', 60000);
   });
 
-  await step('toggle without a room is rejected', async () => {
-    await toTab({ cmd: 'toggle' });
-    await sleep(300);
-    assert.equal((await toTab({ cmd: 'getStatus' })).gone, false);
-    assert.ok(await isPerson());
-  });
+  if (FACE_VIDEO) {
+    await step('face is found and Clawd covers it', async () => {
+      await waitFor('face', async () => (await status()).face, 15000);
+      await sleep(500);
+      const { share, box } = await clawd();
+      assert.ok(share > 0.08, `Clawd should take a big part of the frame, got ${(share * 100).toFixed(1)}%`);
+      const cx = (box[0] + box[2]) / 2;
+      assert.ok(Math.abs(cx - size.w / 2) < size.w * 0.15, `Clawd should be centered on the face, box=${box}`);
+    });
 
-  await step('capture empty room → saved to storage', async () => {
-    await waitFor('empty room phase', async () => !(await isPerson()), 25000);
-    await toTab({ cmd: 'capture', delay: 0 });
-    await waitFor('room in storage', async () => !!(await storage()).room, 5000);
-    const { room } = await storage();
-    assert.match(room, /^data:image\/jpeg;base64,/);
-    assert.equal((await toTab({ cmd: 'getStatus' })).hasRoom, true);
-    await page.evaluate((u) => window.setRoom(u), room);
-  });
-
-  await step('plain vanish: person replaced by the room', async () => {
-    await storage({ thanos: false });
-    await waitFor('person back in frame', isPerson);
-    await sleep(400);
-    await toTab({ cmd: 'toggle' });
-    await sleep(800);
-    assert.equal((await toTab({ cmd: 'getStatus' })).gone, true);
-    const d = await page.evaluate(() => window.diff(120, 50, 330, 270));
-    assert.ok(d < 0.03, `person area should look like the room, diff=${d.toFixed(3)}`);
-  });
-
-  await step('plain appear: person is back', async () => {
-    await toTab({ cmd: 'toggle' });
-    await sleep(800);
-    assert.equal((await toTab({ cmd: 'getStatus' })).gone, false);
-    assert.ok(await isPerson());
-  });
+    await step('mouth moves while talking', async () => {
+      let lo = 1;
+      let hi = 0;
+      for (let i = 0; i < 40; i++) {
+        const { mouth } = await status();
+        lo = Math.min(lo, mouth);
+        hi = Math.max(hi, mouth);
+        await sleep(75);
+      }
+      assert.ok(hi > 0.25 && hi - lo > 0.15, `mouth should open and close, range ${lo.toFixed(2)}..${hi.toFixed(2)}`);
+    });
+  }
 
   const frames = [];
-  const shoot = async (n, every) => {
-    for (let i = 0; i < n; i++) {
-      const t = Date.now();
-      frames.push(await page.screenshot({ type: 'png', clip: { x: 0, y: 0, width: 960, height: 540 } }));
-      await sleep(Math.max(0, every - (Date.now() - t)));
+  if (DEMO) {
+    for (let i = 0; i < 40; i++) {
+      frames.push(await page.screenshot({ type: 'png' }));
+      await sleep(70);
     }
-  };
+  }
 
-  await step('Thanos vanish: dissolves gradually, dust flies, then empty', async () => {
-    await storage({ thanos: true });
-    await sleep(200);
-    const before = await page.evaluate(() => window.diff(120, 50, 330, 270));
-    assert.ok(before > 0.4, `person should be visible, diff=${before.toFixed(3)}`);
-    await toTab({ cmd: 'toggle' });
-    if (DEMO) await shoot(13, 100);
-    else await sleep(1300);
-    const mid = await page.evaluate(() => window.diff(120, 50, 330, 270));
-    const dust = await page.evaluate(() => window.diff(340, 0, 480, 200));
-    assert.ok(mid < before * 0.95 && mid > before * 0.05, `mid dissolve should be partial: ${mid.toFixed(3)} of ${before.toFixed(3)}`);
-    assert.ok(dust > 0.002, `dust should fly to the right, diff=${dust.toFixed(4)}`);
-    if (DEMO) await shoot(22, 100);
-    else await sleep(2400);
-    const st = await toTab({ cmd: 'getStatus' });
-    assert.equal(st.gone, true);
-    assert.equal(st.animating, false);
-    const after = await page.evaluate(() => window.diff(0, 0, 480, 270));
-    assert.ok(after < 0.03, `frame should be the empty room, diff=${after.toFixed(3)}`);
+  await step('mascot off: camera passes through untouched', async () => {
+    await storage({ mascot: false });
+    await waitFor('mascot off', async () => !(await status()).mascot, 3000);
+    await sleep(300);
+    const { share } = await clawd();
+    assert.ok(share < 0.01, `no Clawd expected, got ${(share * 100).toFixed(1)}%`);
   });
 
-  await step('Thanos appear: dust gathers back into the person', async () => {
-    if (DEMO) await shoot(6, 100);
-    await toTab({ cmd: 'toggle' });
-    // The first ~40% of the appear is dust flying in, the body forms after that.
-    if (DEMO) await shoot(16, 100);
-    else await sleep(1600);
-    const mid = await page.evaluate(() => window.diff(120, 50, 330, 270));
-    assert.ok(mid > 0.02 && mid < 0.6, `mid appear should be partial, diff=${mid.toFixed(3)}`);
-    if (DEMO) await shoot(14, 100);
-    else await sleep(1400);
-    assert.equal((await toTab({ cmd: 'getStatus' })).gone, false);
-    assert.ok(await isPerson(), 'person should be back');
+  await step('capture room → saved, background becomes the still snapshot', async () => {
+    await toTab({ cmd: 'capture', delay: 0 });
+    await waitFor('room in storage', async () => !!(await storage()).room, 5000);
+    assert.match((await storage()).room, /^data:image\/jpeg;base64,/);
+    assert.equal((await status()).hasRoom, true);
+    await storage({ mascot: true });
+    await waitFor('mascot on', async () => (await status()).mascot, 3000);
+    await sleep(500);
+    // Bottom-left corner is outside Clawd: the image there must stop changing.
+    const corner = [0, size.h - 60, 120, size.h];
+    await page.evaluate((b) => window.motion(...b), corner);
+    await sleep(400);
+    const m = await page.evaluate((b) => window.motion(...b), corner);
+    assert.ok(m < 1, `background should be still, motion=${m.toFixed(2)}`);
   });
 
   if (DEMO) {
     const dir = join(out, 'frames');
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dir);
-    const { writeFileSync } = await import('node:fs');
     frames.forEach((f, i) => writeFileSync(join(dir, `${String(i).padStart(3, '0')}.png`), f));
     execFileSync('ffmpeg', [
-      '-v', 'error', '-y', '-framerate', '10', '-i', join(dir, '%03d.png'),
-      '-vf', 'scale=640:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer',
+      '-v', 'error', '-y', '-framerate', '12', '-i', join(dir, '%03d.png'),
+      '-vf', 'scale=480:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96[p];[b][p]paletteuse=dither=bayer',
       join(out, 'demo.gif'),
     ]);
 
     // Popup, pretending the Meet tab is the active one.
     const popup = await context.newPage();
-    await popup.setViewportSize({ width: 340, height: 330 });
+    await popup.setViewportSize({ width: 340, height: 300 });
     await popup.addInitScript(() => {
       const q = chrome.tabs.query.bind(chrome.tabs);
       chrome.tabs.query = () => q({ url: 'https://meet.google.com/*' });
     });
     await popup.goto(`chrome-extension://${extId}/popup/popup.html`);
-    await popup.waitForFunction(() => document.getElementById('pill').textContent === 'камера активна');
+    await popup.waitForFunction(() => document.getElementById('pill').textContent !== '…');
     await popup.screenshot({ path: join(out, 'popup.png'), fullPage: true });
     await popup.close();
   }
 
   await step('stopping the wrapped track stops the camera', async () => {
     await page.evaluate(() => window.stream.getVideoTracks()[0].stop());
-    await waitFor('camera off', async () => !(await toTab({ cmd: 'getStatus' })).camera, 5000);
+    await waitFor('camera off', async () => !(await status()).camera, 5000);
   });
 
   console.log(`\n${passed} passed`);

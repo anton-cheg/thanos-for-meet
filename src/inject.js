@@ -1,111 +1,158 @@
 // Runs in the page's MAIN world at document_start. Wraps getUserMedia so every
-// camera track goes through our frame pipeline before Meet sees it.
+// camera track goes through our frame pipeline before Meet sees it: your face
+// is tracked and you are replaced by Clawd, the Claude Code mascot.
 (() => {
-  if (window.__thanosMeet) return;
-  window.__thanosMeet = true;
+  if (window.__clawdMeet) return;
+  window.__clawdMeet = true;
 
-  const NS = 'thanos-meet';
+  const NS = 'clawd-meet';
   const md = navigator.mediaDevices;
   if (!md || !md.getUserMedia || !window.MediaStreamTrackProcessor || !window.MediaStreamTrackGenerator) {
-    console.warn('[thanos] insertable streams are not supported, extension disabled');
+    console.warn('[clawd] insertable streams are not supported, extension disabled');
     return;
   }
 
-  // Analysis resolution for the person mask / dissolve grid.
-  const AW = 160;
-  const MAX_PARTICLES = 22000;
-  const DIFF_THRESHOLD = 70;
-  const FADE_MS = 450;
-  const VANISH_MS = 3200;
-  const APPEAR_MS = 2600;
-  // In normalized animation time: cells start dissolving in [0, SPREAD],
-  // each particle lives for LIFE afterwards.
-  const SPREAD = 0.62;
-  const LIFE = 0.38;
+  const DETECT_WIDTH = 256;
+  const DETECT_EVERY_MS = 50;
+  const FACE_HOLD_MS = 1500; // keep the mascot where the face was last seen
+  const FOLLOW = 0.35; // per-frame smoothing toward the latest detection
+  const CLAWD_COLOR = '#d77757';
+  const INK = '#1b1310';
+  const MOUTH_COLOR = '#3a1a14';
 
   const state = {
     room: null, // ImageBitmap of the empty room
-    roomSmall: new Map(), // "w x h" -> ImageData of the room at analysis size
-    thanos: true,
-    gone: false,
+    mascot: false,
   };
-  let anim = null; // { id, kind: 'vanish' | 'appear', thanos, start, dur }
-  let animSeq = 0;
   const pipes = new Set();
 
   const post = (msg) => window.postMessage({ ns: NS, dir: 'out', ...msg }, '*');
 
-  const status = () => ({
-    type: 'status',
-    camera: [...pipes].some((p) => p.src.readyState === 'live'),
-    hasRoom: !!state.room,
-    gone: state.gone,
-    animating: !!anim,
-    thanos: state.thanos,
-  });
-  const sendStatus = () => post(status());
+  // ---------- face tracking (detector lives in an extension iframe) ----------
 
-  // ---------- helpers ----------
-
-  const canvas2d = (w, h, opts) => {
-    const c = new OffscreenCanvas(w, h);
-    return [c, c.getContext('2d', opts)];
+  const tracker = {
+    port: null,
+    ready: false,
+    busy: false,
+    lastReq: 0,
+    target: null, // latest detection, normalized coords
+    seenAt: 0,
+    cur: null, // smoothed pose actually drawn
   };
 
-  const hash = (x, y, seed) => {
-    let h = (x * 374761393 + y * 668265263 + seed * 2147483647) | 0;
-    h = Math.imul(h ^ (h >>> 13), 1274126177);
-    return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+  const setDetectorPort = (port) => {
+    tracker.port?.close();
+    tracker.port = port;
+    tracker.ready = false;
+    tracker.busy = false;
+    port.onmessage = ({ data }) => {
+      if (data.type === 'ready') {
+        tracker.ready = true;
+        sendStatus();
+      } else if (data.type === 'face') {
+        tracker.busy = false;
+        const hadFace = !!tracker.target;
+        if (data.face) {
+          tracker.target = data.face;
+          tracker.seenAt = performance.now();
+        } else if (performance.now() - tracker.seenAt > FACE_HOLD_MS) {
+          tracker.target = null;
+        }
+        if (hadFace !== !!tracker.target) sendStatus();
+      }
+    };
   };
 
-  // Smooth value noise, two octaves, in [0, 1].
-  const noise = (x, y, seed) => {
+  const requestDetection = (frame, w, h) => {
+    const now = performance.now();
+    if (!tracker.ready || tracker.busy || now - tracker.lastReq < DETECT_EVERY_MS) return;
+    tracker.busy = true;
+    tracker.lastReq = now;
+    const copy = frame.clone();
+    createImageBitmap(copy, { resizeWidth: DETECT_WIDTH, resizeHeight: Math.round((DETECT_WIDTH * h) / w) })
+      .then((bitmap) => tracker.port.postMessage({ bitmap, w, h }, [bitmap]))
+      .catch(() => (tracker.busy = false))
+      .finally(() => copy.close());
+  };
+
+  // ---------- microphone level, so the mouth moves when you talk ----------
+
+  const voice = { analyser: null, buf: null, level: 0 };
+
+  const tapAudio = (track) => {
+    try {
+      const ctx = (voice.ctx ??= new AudioContext());
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      ctx.createMediaStreamSource(new MediaStream([track])).connect(analyser);
+      voice.analyser = analyser;
+      voice.buf = new Float32Array(analyser.fftSize);
+      if (ctx.state === 'suspended') {
+        const resume = () => ctx.resume();
+        window.addEventListener('pointerdown', resume, { once: true, capture: true });
+        window.addEventListener('keydown', resume, { once: true, capture: true });
+      }
+    } catch (e) {
+      console.warn('[clawd] cannot tap microphone', e);
+    }
+  };
+
+  const voiceLevel = () => {
+    if (!voice.analyser) return 0;
+    voice.analyser.getFloatTimeDomainData(voice.buf);
     let sum = 0;
-    let amp = 0.65;
-    let freq = 1;
-    for (let o = 0; o < 2; o++) {
-      const fx = x * freq;
-      const fy = y * freq;
-      const ix = Math.floor(fx);
-      const iy = Math.floor(fy);
-      const tx = fx - ix;
-      const ty = fy - iy;
-      const sx = tx * tx * (3 - 2 * tx);
-      const sy = ty * ty * (3 - 2 * ty);
-      const a = hash(ix, iy, seed + o);
-      const b = hash(ix + 1, iy, seed + o);
-      const c = hash(ix, iy + 1, seed + o);
-      const d = hash(ix + 1, iy + 1, seed + o);
-      sum += amp * (a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy);
-      amp *= 0.35 / 0.65;
-      freq *= 2.7;
-    }
-    return sum;
+    for (const v of voice.buf) sum += v * v;
+    const rms = Math.sqrt(sum / voice.buf.length);
+    return Math.min(1, Math.max(0, (rms - 0.012) * 12));
   };
 
-  const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2);
+  // ---------- Clawd ----------
 
-  const getRoomSmall = (aw, ah) => {
-    const key = `${aw}x${ah}`;
-    let data = state.roomSmall.get(key);
-    if (!data && state.room) {
-      const [, ctx] = canvas2d(aw, ah, { willReadFrequently: true });
-      ctx.drawImage(state.room, 0, 0, aw, ah);
-      data = ctx.getImageData(0, 0, aw, ah);
-      state.roomSmall.set(key, data);
-    }
-    return data;
-  };
+  // Pixel grid derived from the Claude Code logo (▐▛███▜▌ / ▝▜█████▛▘ / ▘▘ ▝▝)
+  // at 2x, with a taller body so it covers a torso. 36 cells wide.
+  const GRID_W = 36;
+  const BODY_ROWS = [];
+  for (let y = 0; y < 4; y++) BODY_ROWS.push([y, 6, 30]); // head
+  for (let y = 4; y < 6; y++) BODY_ROWS.push([y, 2, 34]); // arms
+  for (let y = 6; y < 14; y++) BODY_ROWS.push([y, 6, 30]); // belly
+  const LEGS = [8, 12, 22, 26].map((x) => [14, x, x + 2, 2]);
+  const EYES = [10, 24];
+  const EYE_ROW = 2.5; // center row of Clawd's eyes
+  // Clawd's eyes sit near the top of its head, so lift it above the real eyes
+  // far enough to also cover the forehead and hair.
+  const EYE_LIFT = 3.5;
+  const BODY_CELLS = 24; // head width in cells, matched to shoulder width
+  const SHOULDERS_PER_FACE = 3.1;
 
-  const setRoom = async (source) => {
-    state.room = source ? await createImageBitmap(source) : null;
-    state.roomSmall.clear();
-    if (!state.room) {
-      state.gone = false;
-      anim = null;
+  function drawClawd(ctx, cx, cy, cell, roll, mouth, blinkL, blinkR) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(roll);
+    ctx.scale(cell, cell);
+    ctx.translate(-GRID_W / 2, -EYE_ROW - EYE_LIFT);
+
+    ctx.fillStyle = CLAWD_COLOR;
+    ctx.beginPath();
+    for (const [y, x0, x1] of BODY_ROWS) ctx.rect(x0, y, x1 - x0, 1.02);
+    for (const [y, x0, x1, hgt] of LEGS) ctx.rect(x0, y, x1 - x0, hgt);
+    ctx.fill();
+
+    // Eyes: tall slits that close when you blink. The image is not mirrored,
+    // so the left eye on screen is the subject's right one.
+    ctx.fillStyle = INK;
+    [blinkR, blinkL].forEach((blink, i) => {
+      const hgt = Math.max(0.35, 3 * (1 - Math.min(1, blink * 1.3)));
+      ctx.fillRect(EYES[i], EYE_ROW - hgt / 2, 2, hgt);
+    });
+
+    if (mouth > 0.06) {
+      const hgt = 0.5 + mouth * 3.5;
+      const wid = 4 + mouth * 2;
+      ctx.fillStyle = MOUTH_COLOR;
+      ctx.fillRect(GRID_W / 2 - wid / 2, 5, wid, hgt);
     }
-    sendStatus();
-  };
+    ctx.restore();
+  }
 
   // ---------- per-track pipeline ----------
 
@@ -117,7 +164,7 @@
       this.writer = this.gen.writable.getWriter();
       this.canvas = null;
       this.ctx = null;
-      this.fx = null; // effect data built for a specific anim id
+      this.mouth = 0;
       this.captureReq = null;
       this.patchTrack();
       pipes.add(this);
@@ -148,70 +195,55 @@
           try {
             out = this.process(frame);
           } catch (e) {
-            console.error('[thanos] frame error', e);
+            console.error('[clawd] frame error', e);
           }
           if (out !== frame) frame.close();
           await this.writer.write(out);
         }
       } catch (e) {
-        if (this.src.readyState === 'live') console.error('[thanos] pipeline stopped', e);
+        if (this.src.readyState === 'live') console.error('[clawd] pipeline stopped', e);
       } finally {
         pipes.delete(this);
         sendStatus();
       }
     }
 
-    ensureCanvas(w, h) {
-      if (!this.canvas || this.canvas.width !== w || this.canvas.height !== h) {
-        [this.canvas, this.ctx] = canvas2d(w, h, { willReadFrequently: true });
-        this.fx = null;
-      }
-    }
-
-    output(frame) {
-      return new VideoFrame(this.canvas, { timestamp: frame.timestamp, duration: frame.duration ?? undefined });
-    }
-
     process(frame) {
       const w = frame.displayWidth;
       const h = frame.displayHeight;
-
       if (this.captureReq) this.feedCapture(frame, w, h);
+      if (!state.mascot) return frame; // passthrough, zero cost
 
-      const now = performance.now();
-      if (anim && now - anim.start >= anim.dur) {
-        state.gone = anim.kind === 'vanish';
-        anim = null;
-        this.fx = null;
-        sendStatus();
+      requestDetection(frame, w, h);
+
+      if (!this.canvas || this.canvas.width !== w || this.canvas.height !== h) {
+        this.canvas = new OffscreenCanvas(w, h);
+        this.ctx = this.canvas.getContext('2d');
       }
-
-      if (!anim && (!state.gone || !state.room)) return frame; // passthrough, zero cost
-
-      this.ensureCanvas(w, h);
       const ctx = this.ctx;
+      // With a snapshot of the empty room the real body disappears completely.
+      ctx.drawImage(state.room ?? frame, 0, 0, w, h);
 
-      if (!anim) {
-        ctx.drawImage(state.room, 0, 0, w, h);
-        return this.output(frame);
+      const t = tracker.target;
+      if (t) {
+        const faceW = (t.x1 - t.x0) * w;
+        const target = { x: t.eyeX * w, y: t.eyeY * h, size: faceW, roll: t.roll };
+        const c = (tracker.cur ??= target);
+        c.x += (target.x - c.x) * FOLLOW;
+        c.y += (target.y - c.y) * FOLLOW;
+        c.size += (target.size - c.size) * FOLLOW;
+        c.roll += (target.roll - c.roll) * FOLLOW;
+
+        // Fast attack, slower release, so speech reads as chatter, not flicker.
+        const want = Math.min(1, Math.max(t.jaw * 1.8, voiceLevel()));
+        this.mouth += (want - this.mouth) * (want > this.mouth ? 0.6 : 0.25);
+
+        const cell = (c.size * SHOULDERS_PER_FACE) / BODY_CELLS;
+        drawClawd(ctx, c.x, c.y, cell, c.roll, this.mouth, t.blinkL, t.blinkR);
+      } else {
+        tracker.cur = null;
       }
-
-      const t = Math.min(1, (now - anim.start) / anim.dur);
-      if (!anim.thanos) {
-        // plain crossfade
-        const a = easeInOut(anim.kind === 'vanish' ? t : 1 - t);
-        ctx.globalAlpha = 1;
-        ctx.drawImage(frame, 0, 0, w, h);
-        ctx.globalAlpha = a;
-        ctx.drawImage(state.room, 0, 0, w, h);
-        ctx.globalAlpha = 1;
-        return this.output(frame);
-      }
-
-      if (!this.fx || this.fx.id !== anim.id) this.fx = this.buildDust(frame, w, h);
-      // Appear is the vanish played backwards: particles fly back in.
-      this.renderDust(frame, w, h, anim.kind === 'vanish' ? t : 1 - t);
-      return this.output(frame);
+      return new VideoFrame(this.canvas, { timestamp: frame.timestamp, duration: frame.duration ?? undefined });
     }
 
     // ---- room capture: average a few frames to kill sensor noise ----
@@ -223,7 +255,8 @@
         req.h = h;
         req.acc = new Float32Array(w * h * 4);
         req.got = 0;
-        [req.c, req.ctx] = canvas2d(w, h, { willReadFrequently: true });
+        req.c = new OffscreenCanvas(w, h);
+        req.ctx = req.c.getContext('2d', { willReadFrequently: true });
       }
       req.ctx.drawImage(frame, 0, 0, w, h);
       const d = req.ctx.getImageData(0, 0, w, h).data;
@@ -237,173 +270,6 @@
       this.captureReq = null;
       req.resolve(req.c);
     }
-
-    // ---- Thanos dust ----
-
-    buildDust(frame, w, h) {
-      const aw = AW;
-      const ah = Math.max(1, Math.round((AW * h) / w));
-      const [, sctx] = canvas2d(aw, ah, { willReadFrequently: true });
-      sctx.drawImage(frame, 0, 0, aw, ah);
-      const live = sctx.getImageData(0, 0, aw, ah).data;
-      const room = getRoomSmall(aw, ah).data;
-
-      // Person mask = pixels that differ from the empty room.
-      const raw = new Uint8Array(aw * ah);
-      for (let i = 0, p = 0; i < raw.length; i++, p += 4) {
-        const diff = Math.abs(live[p] - room[p]) + Math.abs(live[p + 1] - room[p + 1]) + Math.abs(live[p + 2] - room[p + 2]);
-        raw[i] = diff > DIFF_THRESHOLD ? 1 : 0;
-      }
-      // Majority filter (drops speckles) + 1px dilation.
-      const mask = new Uint8Array(aw * ah);
-      for (let y = 0; y < ah; y++) {
-        for (let x = 0; x < aw; x++) {
-          let n = 0;
-          for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-              const xx = x + dx;
-              const yy = y + dy;
-              if (xx >= 0 && yy >= 0 && xx < aw && yy < ah) n += raw[yy * aw + xx];
-            }
-          }
-          mask[y * aw + x] = n >= 3 ? 1 : 0;
-        }
-      }
-
-      // When each cell turns to dust: left to right across the person, broken up by noise.
-      let minX = aw;
-      let maxX = 0;
-      for (let i = 0; i < mask.length; i++) {
-        if (!mask[i]) continue;
-        const x = i % aw;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-      }
-      const span = Math.max(1, maxX - minX);
-      const seed = (Math.random() * 1e6) | 0;
-      const cellT = new Float32Array(aw * ah);
-      for (let y = 0; y < ah; y++) {
-        for (let x = 0; x < aw; x++) {
-          const n = noise(x / 14, y / 14, seed);
-          const xn = (x - minX) / span;
-          cellT[y * aw + x] = SPREAD * Math.min(1, Math.max(0, 0.7 * xn + 0.6 * n - 0.3));
-        }
-      }
-
-      // Particles: sample the full-res frame inside the mask.
-      const [, fctx] = canvas2d(w, h, { willReadFrequently: true });
-      fctx.drawImage(frame, 0, 0, w, h);
-      const full = fctx.getImageData(0, 0, w, h).data;
-      let maskCount = 0;
-      for (let i = 0; i < mask.length; i++) maskCount += mask[i];
-      const area = maskCount * (w / aw) * (h / ah);
-      const step = Math.max(2, Math.ceil(Math.sqrt(area / MAX_PARTICLES)));
-      const kx = aw / w;
-      const ky = ah / h;
-      const scale = w / 640;
-
-      const P = [];
-      const C = [];
-      for (let y = 0; y < h; y += step) {
-        const my = Math.min(ah - 1, (y * ky) | 0);
-        for (let x = 0; x < w; x += step) {
-          const mx = Math.min(aw - 1, (x * kx) | 0);
-          const cell = my * aw + mx;
-          if (!mask[cell]) continue;
-          const r = Math.random();
-          // x0, y0, vx, vy, ax, t0, phase, wobble
-          P.push(
-            x,
-            y,
-            (60 + r * 220) * scale,
-            (-30 - Math.random() * 110) * scale,
-            (40 + Math.random() * 120) * scale,
-            cellT[cell] + Math.random() * 0.04,
-            Math.random() * Math.PI * 2,
-            (4 + Math.random() * 14) * scale
-          );
-          const p = (y * w + x) * 4;
-          C.push(full[p] | (full[p + 1] << 8) | (full[p + 2] << 16));
-        }
-      }
-
-      const [maskCanvas, maskCtx] = canvas2d(aw, ah);
-      const [roomLayer, roomCtx] = canvas2d(w, h);
-      const [dustLayer, dustCtx] = canvas2d(w, h);
-      return {
-        id: anim.id,
-        aw,
-        ah,
-        cellT,
-        mask,
-        particles: new Float32Array(P),
-        colors: new Uint32Array(C),
-        size: Math.max(2, Math.round(step * 0.9)),
-        dur: anim.dur / 1000,
-        maskCanvas,
-        maskCtx,
-        maskImg: maskCtx.createImageData(aw, ah),
-        roomLayer,
-        roomCtx,
-        dustLayer,
-        dustCtx,
-        dustImg: dustCtx.createImageData(w, h),
-      };
-    }
-
-    renderDust(frame, w, h, t) {
-      const fx = this.fx;
-      const ctx = this.ctx;
-
-      // 1. live camera
-      ctx.drawImage(frame, 0, 0, w, h);
-
-      // 2. empty room over the cells that already turned to dust (soft edges)
-      const ma = fx.maskImg.data;
-      for (let i = 0; i < fx.cellT.length; i++) {
-        const a = (t - fx.cellT[i]) / 0.05;
-        ma[i * 4 + 3] = a <= 0 ? 0 : a >= 1 ? 255 : a * 255;
-      }
-      fx.maskCtx.putImageData(fx.maskImg, 0, 0);
-      const rc = fx.roomCtx;
-      rc.globalCompositeOperation = 'copy';
-      rc.drawImage(state.room, 0, 0, w, h);
-      rc.globalCompositeOperation = 'destination-in';
-      rc.imageSmoothingEnabled = true;
-      rc.drawImage(fx.maskCanvas, 0, 0, w, h);
-      ctx.drawImage(fx.roomLayer, 0, 0);
-
-      // 3. flying dust
-      const buf = new Uint32Array(fx.dustImg.data.buffer);
-      buf.fill(0);
-      const P = fx.particles;
-      const C = fx.colors;
-      const s = fx.size;
-      for (let i = 0, j = 0; i < P.length; i += 8, j++) {
-        const age = t - P[i + 5];
-        if (age <= 0 || age >= LIFE) continue;
-        const sec = age * fx.dur;
-        const life = age / LIFE;
-        const alpha = (1 - life) ** 1.4;
-        const x = (P[i] + P[i + 2] * sec + 0.5 * P[i + 4] * sec * sec + Math.sin(P[i + 6] + sec * 4) * P[i + 7] * life) | 0;
-        const y = (P[i + 1] + P[i + 3] * sec + Math.cos(P[i + 6] + sec * 3) * P[i + 7] * life) | 0;
-        const sz = Math.max(1, Math.round(s * (1 - life * 0.6)));
-        if (x < 0 || y < 0 || x + sz > w || y + sz > h) continue;
-        // Dust darkens and desaturates as it flies off.
-        const col = C[j];
-        const k = 1 - 0.55 * life;
-        const r = (col & 255) * k;
-        const g = ((col >> 8) & 255) * k;
-        const b = ((col >> 16) & 255) * k;
-        const px = (r | (g << 8) | (b << 16) | ((alpha * 255) << 24)) >>> 0;
-        for (let yy = 0; yy < sz; yy++) {
-          const row = (y + yy) * w + x;
-          for (let xx = 0; xx < sz; xx++) buf[row + xx] = px;
-        }
-      }
-      fx.dustCtx.putImageData(fx.dustImg, 0, 0);
-      ctx.drawImage(fx.dustLayer, 0, 0);
-    }
   }
 
   // ---------- getUserMedia hook ----------
@@ -411,13 +277,14 @@
   const realGetUserMedia = md.getUserMedia.bind(md);
   md.getUserMedia = async function getUserMedia(constraints) {
     const stream = await realGetUserMedia(constraints);
-    if (!constraints || !constraints.video) return stream;
+    if (constraints?.audio) stream.getAudioTracks().forEach(tapAudio);
+    if (!constraints?.video) return stream;
     const tracks = stream.getTracks().map((track) => {
       if (track.kind !== 'video') return track;
       try {
         return new Pipe(track).gen;
       } catch (e) {
-        console.error('[thanos] cannot wrap track', e);
+        console.error('[clawd] cannot wrap track', e);
         return track;
       }
     });
@@ -425,9 +292,26 @@
     return new MediaStream(tracks);
   };
 
-  // ---------- commands ----------
+  // ---------- status & commands ----------
 
   const livePipe = () => [...pipes].find((p) => p.src.readyState === 'live');
+
+  function sendStatus() {
+    post({
+      type: 'status',
+      camera: !!livePipe(),
+      hasRoom: !!state.room,
+      mascot: state.mascot,
+      detector: !tracker.port ? 'off' : tracker.ready ? 'ready' : 'loading',
+      face: !!tracker.target,
+      mouth: livePipe()?.mouth ?? 0,
+    });
+  }
+
+  const setRoom = async (source) => {
+    state.room = source ? await createImageBitmap(source) : null;
+    sendStatus();
+  };
 
   const capture = async () => {
     const pipe = livePipe();
@@ -448,26 +332,6 @@
     post({ type: 'roomCaptured', dataUrl });
   };
 
-  const go = (kind) => {
-    if (!state.room) {
-      post({ type: 'error', code: 'no-room' });
-      return;
-    }
-    const wantGone = kind === 'vanish';
-    const current = anim ? anim.kind === 'vanish' : state.gone;
-    if (wantGone === current) return;
-    // Reversing mid-animation is not supported: finish instantly, then start.
-    state.gone = !wantGone;
-    anim = {
-      id: ++animSeq,
-      kind,
-      thanos: state.thanos,
-      start: performance.now(),
-      dur: state.thanos ? (wantGone ? VANISH_MS : APPEAR_MS) : FADE_MS,
-    };
-    sendStatus();
-  };
-
   window.addEventListener('message', (e) => {
     if (e.source !== window) return;
     const m = e.data;
@@ -478,22 +342,18 @@
           fetch(m.dataUrl)
             .then((r) => r.blob())
             .then(setRoom)
-            .catch((err) => console.error('[thanos] bad room image', err));
+            .catch((err) => console.error('[clawd] bad room image', err));
         } else setRoom(null);
         break;
-      case 'setThanos':
-        state.thanos = !!m.value;
+      case 'setMascot':
+        state.mascot = !!m.value;
         sendStatus();
+        break;
+      case 'detectorPort':
+        if (e.ports[0]) setDetectorPort(e.ports[0]);
         break;
       case 'capture':
         capture();
-        break;
-      case 'vanish':
-      case 'appear':
-        go(m.type);
-        break;
-      case 'toggle':
-        go((anim ? anim.kind === 'vanish' : state.gone) ? 'appear' : 'vanish');
         break;
       case 'status':
         sendStatus();

@@ -1,15 +1,17 @@
 {
-  "name": "thanos-for-meet",
+  "name": "clawd-for-meet",
   "version": "1.0.0",
   "private": true,
-  "description": "Chrome extension: disappear from your Google Meet camera, optionally Thanos-style",
+  "description": "Chrome extension: Clawd, the Claude Code mascot, replaces you in Google Meet and talks with your mouth",
   "license": "MIT",
   "scripts": {
     "test": "node test/e2e.mjs",
     "icons": "python3 scripts/make_icons.py",
-    "zip": "zip -r thanos-for-meet.zip manifest.json src popup icons"
+    "zip": "zip -r clawd-for-meet.zip manifest.json src popup detector vendor icons",
+    "vendor": "cp node_modules/@mediapipe/tasks-vision/vision_bundle.mjs vendor/ && cp node_modules/@mediapipe/tasks-vision/wasm/vision_wasm_internal.* vendor/wasm/ && curl -sSfL -o vendor/face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
   },
   "devDependencies": {
+    "@mediapipe/tasks-vision": "1.0.1",
     "playwright": "1.64.1"
   }
 }

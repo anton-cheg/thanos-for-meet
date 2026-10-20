@@ -3,8 +3,7 @@ const pill = $('pill');
 const preview = $('preview');
 const roomText = $('roomText');
 const captureBtn = $('capture');
-const toggleBtn = $('toggle');
-const thanosBox = $('thanos');
+const mascotBox = $('mascot');
 
 let tabId = null;
 let status = null;
@@ -15,25 +14,24 @@ const send = (cmd) => chrome.tabs.sendMessage(tabId, { cmd }).catch(() => null);
 function render() {
   const onMeet = tabId !== null && status;
   captureBtn.disabled = !onMeet || !status.camera || status.countingDown;
-  toggleBtn.disabled = !onMeet || !status.camera || !hasRoom;
-  toggleBtn.textContent = status?.gone ? 'Вернуться' : 'Исчезнуть';
-  toggleBtn.classList.toggle('back', !!status?.gone);
   captureBtn.textContent = status?.countingDown ? 'Выйди из кадра…' : hasRoom ? 'Переснять' : 'Снять комнату';
 
   pill.className = 'pill';
   if (!onMeet) pill.textContent = 'открой Google Meet';
-  else if (!status.camera) pill.textContent = 'камера выключена';
-  else if (status.gone) {
-    pill.textContent = 'тебя нет';
-    pill.classList.add('gone');
-  } else {
-    pill.textContent = 'камера активна';
+  else if (!status.camera) pill.textContent = 'камера не включена';
+  else if (!status.mascot) {
+    pill.textContent = 'камера как есть';
     pill.classList.add('ok');
+  } else if (status.detector !== 'ready') pill.textContent = 'загружаю трекинг…';
+  else if (!status.face) pill.textContent = 'лицо не найдено';
+  else {
+    pill.textContent = 'Clawd в кадре';
+    pill.classList.add('clawd');
   }
 
   roomText.textContent = hasRoom
-    ? 'Комната сохранена. Можно исчезать.'
-    : 'Выйди из кадра и сними пустую комнату — она заменит тебя в камере.';
+    ? 'Сохранена. Тело стирается целиком — в кадре только Clawd.'
+    : 'Необязательно: сними комнату без себя, чтобы стереть и тело, а не только перекрыть голову.';
 }
 
 function showRoom(dataUrl) {
@@ -44,8 +42,8 @@ function showRoom(dataUrl) {
 }
 
 async function init() {
-  const { room, thanos } = await chrome.storage.local.get({ room: null, thanos: true });
-  thanosBox.checked = thanos;
+  const { room, mascot } = await chrome.storage.local.get({ room: null, mascot: true });
+  mascotBox.checked = mascot;
   showRoom(room);
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -57,8 +55,7 @@ async function init() {
 }
 
 captureBtn.addEventListener('click', () => send('capture'));
-toggleBtn.addEventListener('click', () => send('toggle'));
-thanosBox.addEventListener('change', () => chrome.storage.local.set({ thanos: thanosBox.checked }));
+mascotBox.addEventListener('change', () => chrome.storage.local.set({ mascot: mascotBox.checked }));
 
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg.event === 'status' && sender.tab?.id === tabId) {
@@ -68,6 +65,7 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 });
 chrome.storage.onChanged.addListener((changes) => {
   if (changes.room) showRoom(changes.room.newValue);
+  if (changes.mascot) mascotBox.checked = changes.mascot.newValue;
 });
 
 init();
