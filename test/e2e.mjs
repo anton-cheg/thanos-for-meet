@@ -197,12 +197,13 @@ try {
   await step('Thanos appear: dust gathers back into the person', async () => {
     if (DEMO) await shoot(6, 100);
     await toTab({ cmd: 'toggle' });
-    if (DEMO) await shoot(12, 100);
-    else await sleep(1200);
+    // The first ~40% of the appear is dust flying in, the body forms after that.
+    if (DEMO) await shoot(16, 100);
+    else await sleep(1600);
     const mid = await page.evaluate(() => window.diff(120, 50, 330, 270));
     assert.ok(mid > 0.02 && mid < 0.6, `mid appear should be partial, diff=${mid.toFixed(3)}`);
-    if (DEMO) await shoot(18, 100);
-    else await sleep(1800);
+    if (DEMO) await shoot(14, 100);
+    else await sleep(1400);
     assert.equal((await toTab({ cmd: 'getStatus' })).gone, false);
     assert.ok(await isPerson(), 'person should be back');
   });
